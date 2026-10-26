@@ -223,15 +223,13 @@ class Qwen72BModelConfig(QwenModelConfig):
 class BaseMoEModelConfig(BaseModelConfig):
     """Base class for Mixture-of-Experts models.
 
+    Adds the MoE topology (expert count, top-k routing, per-expert FFN width)
+    and, for DeepSeek-style models, the Multi-head Latent Attention (MLA)
+    dimensions that determine the KV cache footprint.
 
-    Extends ``BaseModelConfig`` with the fields required to simulate
-    MoE-specific execution: expert count, top-k routing, and the expert
-    intermediate dimension (which differs from the dense MLP hidden dim).
-
-    These fields feed the ``MoELayerExecutionTimePredictor`` (see
-    ``vidur/execution_time_predictor/moe_execution_time_predictor.py``),
-    which models expert load imbalance and routing overhead separately
-    from the attention path.
+    Vidur does not ship operator profiling data for MoE models, so these
+    configs cannot drive the execution time predictor yet. They are used for
+    sizing, e.g. the KV transfer volume in the disaggregated P/D simulator.
     """
 
     # MoE topology
@@ -240,16 +238,14 @@ class BaseMoEModelConfig(BaseModelConfig):
     expert_intermediate_dim: int = 0  # per-expert FFN hidden dim
     num_shared_experts: int = 0  # DeepSeek-style always-active experts
 
-    # Multi-head Latent Attention (MLA) — used by DeepSeek models
-    kv_lora_rank: int = 0  # 0 means standard MHA, >0 means MLA
+    # Multi-head Latent Attention (MLA), used by DeepSeek models
+    kv_lora_rank: int = 0  # 0 means standard MHA/GQA, >0 means MLA
     q_lora_rank: Optional[int] = None
-
-    # Expert parallelism degree (for simulation sweep)
-    expert_parallel_degree: int = 1
+    qk_rope_head_dim: int = 0  # decoupled RoPE key dim cached alongside the latent
 
     @staticmethod
     def get_name():
-        return None  # Abstract base — subclasses must override
+        return None
 
 
 @dataclass
@@ -263,9 +259,7 @@ class DeepSeekV3ModelConfig(BaseMoEModelConfig):
     - Top-8 routing (8 experts activated per token)
     - Expert intermediate dim: 2048 per expert
     - Dense layers 0–2 use standard MLP (not MoE)
-
-    Profiling on RTX 3070Ti for latency prediction targets A100/H100 via
-    hardware ratio scaling (documented in profiling_data/deepseek_v3/).
+    - MLA caches kv_lora_rank + qk_rope_head_dim = 576 values per token per layer
     """
 
     # Attention
@@ -294,6 +288,7 @@ class DeepSeekV3ModelConfig(BaseMoEModelConfig):
     # MLA
     kv_lora_rank: int = 512
     q_lora_rank: Optional[int] = 1536
+    qk_rope_head_dim: int = 64
 
     @staticmethod
     def get_name():

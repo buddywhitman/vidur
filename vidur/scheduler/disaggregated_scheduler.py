@@ -1,320 +1,329 @@
-"""Disaggregated prefill/decode scheduler for VIDUR.
-# ruff: noqa: E402
-from __future__ import annotations  # defer annotation evaluation for dataclasses
+"""Disaggregated prefill/decode (P/D) serving simulator.
 
+Models a deployment with separate prefill replicas and decode replicas
+(Splitwise / DistServe / Dynamo-style disaggregation).  A request is prefilled
+on a prefill replica, its KV cache is shipped to a decode replica, and the
+decode replica generates the remaining output tokens with continuous batching.
 
-Models separate prefill-worker and decode-worker fleets (Dynamo-style
-disaggregated serving).  The key addition over the existing collocated
-scheduler is the **KV transfer latency**: after a prefill worker completes a
-request, the generated KV cache must be transferred to a decode worker before
-decoding can begin.
+The goal is to answer questions such as "what prefill:decode replica split
+minimises TTFT/TPOT for model M at load λ?" without running a full cluster.
+Prefill and decode step times come from Vidur's trained execution time
+predictor (see ``build_time_fns_from_predictor``), so the simulator reuses the
+same per-operator profiling data as the rest of Vidur.
 
-This scheduler extends VIDUR's simulation to answer the question:
-    "What is the optimal prefill:decode worker ratio for model M at traffic λ?"
+Modelling assumptions (kept deliberately simple, documented in
+``docs/disaggregated_scheduling.md``):
 
-Usage
------
-Add ``--scheduler_type disaggregated`` to the VIDUR launch command.
-``DisaggregatedReplicaSchedulerConfig`` exposes:
-- ``prefill_fleet_size``: number of prefill replicas
-- ``decode_fleet_size``: number of decode replicas
-- ``interconnect_bandwidth_gbps``: NVLink (600), InfiniBand (400), PCIe (64)
-
-The P/D ratio ``prefill_fleet_size / (prefill_fleet_size + decode_fleet_size)``
-is what Vidur-Search sweeps to find the optimum.
-
-Architecture notes
-------------------
-The scheduler runs as a discrete-event simulation.  Each simulation tick
-advances the clock to the next event (request arrival, prefill completion, KV
-transfer completion, or decode completion).  The queues are:
-
-    arrival_queue → prefill_queue → kv_transfer_queue → decode_queue → done
-
-KV transfer latency is modelled as:
-
-    t_transfer = kv_bytes / bandwidth
-    kv_bytes   = 2 * num_layers * num_kv_heads * kv_head_dim * seq_len * 2  (fp16)
+* Prefill replicas process one request at a time, FIFO.  Prefill is compute
+  bound, so batching prefills mostly trades latency for little throughput.
+* Prefill completion produces the first output token (same convention as
+  ``Request.on_batch_end``); TTFT is measured at prefill completion.
+* Each prefill replica has one outbound link of ``kv_transfer_bandwidth_gb_per_s``
+  (GB/s, aggregate over its tensor-parallel workers).  Transfers leaving the
+  same prefill replica are serialised on that link.
+* Decode replicas run continuous batching: every iteration produces one token
+  for every running request, new requests join at iteration boundaries, and the
+  running batch never exceeds ``max_decode_batch_size``.
+* Requests wait in a single FIFO queue for any free decode slot.
 """
 
-from __future__ import annotations
-
 import heapq
-import logging
+import itertools
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
-from vidur.config import ReplicaConfig
+import numpy as np
 
-logger = logging.getLogger(__name__)
+from vidur.config import BaseExecutionTimePredictorConfig
+from vidur.config.model_config import BaseModelConfig, BaseMoEModelConfig
+from vidur.entities import Batch, Request
+from vidur.execution_time_predictor import BaseExecutionTimePredictor
+
+# (arrived_at, num_prefill_tokens, num_decode_tokens)
+RequestSpec = Tuple[float, int, int]
 
 
-# ---------------------------------------------------------------------------
-# KV transfer helper
-# ---------------------------------------------------------------------------
+def kv_cache_bytes_per_token(
+    model_config: BaseModelConfig, kv_dtype_bytes: int = 2
+) -> int:
+    """KV cache bytes stored per token, summed over all layers.
 
+    Models with Multi-head Latent Attention (``kv_lora_rank > 0``, e.g.
+    DeepSeek-V3) cache one compressed latent vector plus the decoupled RoPE key
+    per token instead of full per-head K and V.
+    """
+    if isinstance(model_config, BaseMoEModelConfig) and model_config.kv_lora_rank > 0:
+        latent_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        return latent_dim * model_config.num_layers * kv_dtype_bytes
 
-def kv_cache_bytes_per_token(replica_config: ReplicaConfig) -> float:
-    """Return the KV cache size in bytes for a single token."""
-    model_cfg = replica_config.model_config
-    # KV cache: 2 tensors (K + V), num_kv_heads heads, head_dim features, fp16
-    head_dim = model_cfg.embedding_dim // model_cfg.num_q_heads
+    head_dim = model_config.embedding_dim // model_config.num_q_heads
     return (
-        2  # K + V
-        * model_cfg.num_kv_heads
+        2  # K and V
+        * model_config.num_kv_heads
         * head_dim
-        * model_cfg.num_layers
-        * 2  # bytes per fp16
+        * model_config.num_layers
+        * kv_dtype_bytes
     )
-
-
-def kv_transfer_latency_s(
-    seq_len: int,
-    replica_config: ReplicaConfig,
-    bandwidth_gbps: float,
-) -> float:
-    """Return the KV transfer wall-clock time in seconds."""
-    bytes_per_token = kv_cache_bytes_per_token(replica_config)
-    total_bytes = bytes_per_token * seq_len
-    return total_bytes / (bandwidth_gbps * 1e9)
-
-
-# ---------------------------------------------------------------------------
-# Simulator events
-# ---------------------------------------------------------------------------
-
-
-@dataclass(order=True)
-class _Event:
-    time: float
-    kind: str = field(compare=False)
-    payload: object = field(compare=False, default=None)
-
-
-# ---------------------------------------------------------------------------
-# Main scheduler
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class DisaggregatedSimulationResult:
-    """Summary statistics from a disaggregated simulation run."""
-
     num_requests: int
-    prefill_fleet_size: int
-    decode_fleet_size: int
-    interconnect_bandwidth_gbps: float
-
-    p50_e2e_latency_s: float
-    p90_e2e_latency_s: float
-    p99_e2e_latency_s: float
-    mean_e2e_latency_s: float
-
-    p50_ttft_s: float  # time-to-first-token
-    p90_ttft_s: float
-    mean_ttft_s: float
-
-    p50_kv_transfer_s: float
-    mean_kv_transfer_s: float
-
-    prefill_utilisation: float
-    decode_utilisation: float
+    makespan_s: float
     throughput_rps: float
+    ttft_s: Dict[str, float]
+    tpot_s: Dict[str, float]
+    e2e_s: Dict[str, float]
+    kv_transfer_s: Dict[str, float]
+    prefill_utilization: float
+    decode_utilization: float
+    mean_decode_batch_size: float
+    max_decode_batch_size_observed: int
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+
+def _percentiles(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0}
+    arr = np.asarray(values)
+    return {
+        "mean": float(arr.mean()),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "p99": float(np.percentile(arr, 99)),
+    }
+
+
+@dataclass
+class _DecodeReplica:
+    # request id -> [kv tokens held, decode iterations still to run]
+    running: Dict[int, List[int]] = field(default_factory=dict)
+    busy: bool = False
+    busy_time_s: float = 0.0
 
 
 class DisaggregatedScheduler:
-    """Discrete-event simulator for disaggregated P/D serving.
+    """Discrete-event simulator for disaggregated prefill/decode serving.
 
     Parameters
     ----------
-    replica_config:
-        VIDUR replica config (used for model dimensions to compute KV size).
-    prefill_fleet_size:
-        Number of prefill workers.
-    decode_fleet_size:
-        Number of decode workers.
-    interconnect_bandwidth_gbps:
-        Interconnect bandwidth for KV cache transfer.
-        Typical values: NVLink 600, InfiniBand 400, PCIe 64.
+    num_prefill_replicas, num_decode_replicas:
+        Size of each fleet.
     prefill_time_fn:
-        Callable ``(seq_len: int) -> float`` returning prefill time in seconds
-        (use VIDUR's existing execution-time predictor).
-    decode_time_fn:
-        Callable ``(seq_len: int, output_len: int) -> float`` returning total
-        decode time in seconds.
+        ``(num_prefill_tokens) -> seconds`` for prefilling one request.
+    decode_step_time_fn:
+        ``(batch_size, avg_kv_tokens) -> seconds`` for one decode iteration.
+    kv_bytes_per_token:
+        KV cache bytes per token (see ``kv_cache_bytes_per_token``).
+    kv_transfer_bandwidth_gb_per_s:
+        Outbound KV transfer bandwidth of each prefill replica, in GB/s.
+    max_decode_batch_size:
+        Maximum number of concurrently running requests per decode replica.
     """
 
     def __init__(
         self,
-        replica_config: ReplicaConfig,
-        prefill_fleet_size: int,
-        decode_fleet_size: int,
-        interconnect_bandwidth_gbps: float,
-        prefill_time_fn,
-        decode_time_fn,
+        num_prefill_replicas: int,
+        num_decode_replicas: int,
+        prefill_time_fn: Callable[[int], float],
+        decode_step_time_fn: Callable[[int, int], float],
+        kv_bytes_per_token: int,
+        kv_transfer_bandwidth_gb_per_s: float,
+        max_decode_batch_size: int,
     ) -> None:
-        self._replica_config = replica_config
-        self._prefill_fleet_size = prefill_fleet_size
-        self._decode_fleet_size = decode_fleet_size
-        self._bandwidth_gbps = interconnect_bandwidth_gbps
+        assert num_prefill_replicas > 0 and num_decode_replicas > 0
+        assert kv_transfer_bandwidth_gb_per_s > 0
+        assert max_decode_batch_size > 0
+
+        self._num_prefill_replicas = num_prefill_replicas
+        self._num_decode_replicas = num_decode_replicas
         self._prefill_time_fn = prefill_time_fn
-        self._decode_time_fn = decode_time_fn
+        self._decode_step_time_fn = decode_step_time_fn
+        self._kv_bytes_per_token = kv_bytes_per_token
+        self._bandwidth_bytes_per_s = kv_transfer_bandwidth_gb_per_s * 1e9
+        self._max_decode_batch_size = max_decode_batch_size
 
-    def simulate(
-        self,
-        requests: List[
-            Tuple[float, int, int]
-        ],  # (arrival_time, prefill_len, output_len)
-    ) -> DisaggregatedSimulationResult:
-        """Run the simulation and return aggregated statistics.
-
-        Parameters
-        ----------
-        requests:
-            List of ``(arrival_time_s, prompt_len, output_len)`` tuples.
-        """
-        import numpy as np
-
-        n = len(requests)
-        if n == 0:
-            raise ValueError("No requests to simulate")
-
-        # Event heap
-        heap: List[_Event] = []
-
-        prefill_workers_free = self._prefill_fleet_size
-        decode_workers_free = self._decode_fleet_size
-
-        prefill_queue: List[Tuple[float, int, int, int]] = (
-            []
-        )  # (arrival, prefill_len, output_len, req_id)
-        kv_queue: List[Tuple[float, int, int, int]] = (
-            []
-        )  # (ready_time, prefill_len, output_len, req_id)
-        decode_queue: List[Tuple[float, int, int, int]] = []  # same
-
-        arrival_times = {}  # req_id -> arrival_time
-        prefill_done = {}  # req_id -> prefill completion time
-        kv_done = {}  # req_id -> kv transfer done time
-        decode_done = {}  # req_id -> decode done time
-
-        prefill_busy_time = 0.0
-        decode_busy_time = 0.0
-
-        # Schedule arrivals
-        for req_id, (arr, plen, olen) in enumerate(requests):
-            heapq.heappush(heap, _Event(arr, "arrival", (req_id, arr, plen, olen)))
-            arrival_times[req_id] = arr
-
-        def try_dispatch_prefill(now: float):
-            nonlocal prefill_workers_free
-            while prefill_workers_free > 0 and prefill_queue:
-                _, plen, olen, req_id = prefill_queue.pop(0)
-                prefill_workers_free -= 1
-                t_prefill = self._prefill_time_fn(plen)
-                t_done = now + t_prefill
-                prefill_busy_time_container[0] += t_prefill
-                heapq.heappush(
-                    heap, _Event(t_done, "prefill_done", (req_id, plen, olen, t_done))
-                )
-
-        def try_dispatch_kv(now: float):
-            while kv_queue:
-                _, plen, olen, req_id = kv_queue.pop(0)
-                t_kv = kv_transfer_latency_s(
-                    plen, self._replica_config, self._bandwidth_gbps
-                )
-                t_done = now + t_kv
-                heapq.heappush(
-                    heap, _Event(t_done, "kv_done", (req_id, plen, olen, t_done))
-                )
-
-        def try_dispatch_decode(now: float):
-            nonlocal decode_workers_free
-            while decode_workers_free > 0 and decode_queue:
-                _, plen, olen, req_id = decode_queue.pop(0)
-                decode_workers_free -= 1
-                t_decode = self._decode_time_fn(plen, olen)
-                t_done = now + t_decode
-                decode_busy_time_container[0] += t_decode
-                heapq.heappush(heap, _Event(t_done, "decode_done", (req_id, t_done)))
-
-        prefill_busy_time_container = [0.0]
-        decode_busy_time_container = [0.0]
-
-        completed = 0
-        sim_end = 0.0
-
-        while heap and completed < n:
-            ev = heapq.heappop(heap)
-            now = ev.time
-            sim_end = max(sim_end, now)
-
-            if ev.kind == "arrival":
-                req_id, arr, plen, olen = ev.payload
-                prefill_queue.append((arr, plen, olen, req_id))
-                try_dispatch_prefill(now)
-
-            elif ev.kind == "prefill_done":
-                nonlocal_prefill_free = True
-                req_id, plen, olen, t_done = ev.payload
-                prefill_workers_free += 1
-                prefill_done[req_id] = t_done
-                kv_queue.append((t_done, plen, olen, req_id))
-                try_dispatch_prefill(now)
-                try_dispatch_kv(now)
-
-            elif ev.kind == "kv_done":
-                req_id, plen, olen, t_done = ev.payload
-                kv_done[req_id] = t_done
-                decode_queue.append((t_done, plen, olen, req_id))
-                try_dispatch_decode(now)
-
-            elif ev.kind == "decode_done":
-                req_id, t_done = ev.payload
-                decode_workers_free += 1
-                decode_done[req_id] = t_done
-                completed += 1
-                try_dispatch_decode(now)
-
-        # Compute statistics
-        e2e_latencies = [
-            decode_done[i] - arrival_times[i] for i in range(n) if i in decode_done
-        ]
-        ttfts = [kv_done[i] - arrival_times[i] for i in range(n) if i in kv_done]
-        kv_latencies = [
-            kv_done[i] - prefill_done[i]
-            for i in range(n)
-            if i in kv_done and i in prefill_done
-        ]
-
-        e2e = np.array(e2e_latencies)
-        ttft = np.array(ttfts)
-        kv_lat = np.array(kv_latencies) if kv_latencies else np.array([0.0])
-
-        total_sim_time = sim_end - requests[0][0] if sim_end > requests[0][0] else 1.0
-        prefill_util = prefill_busy_time_container[0] / (
-            self._prefill_fleet_size * total_sim_time + 1e-9
+    def kv_transfer_time_s(self, num_prefill_tokens: int) -> float:
+        return (
+            num_prefill_tokens * self._kv_bytes_per_token / self._bandwidth_bytes_per_s
         )
-        decode_util = decode_busy_time_container[0] / (
-            self._decode_fleet_size * total_sim_time + 1e-9
-        )
+
+    def simulate(self, requests: List[RequestSpec]) -> DisaggregatedSimulationResult:
+        requests = sorted(requests, key=lambda r: r[0])
+        num_requests = len(requests)
+        assert num_requests > 0
+
+        events = []
+        seq = itertools.count()
+
+        def push(time: float, kind: str, payload) -> None:
+            heapq.heappush(events, (time, next(seq), kind, payload))
+
+        for request_id, (arrived_at, _, _) in enumerate(requests):
+            push(arrived_at, "arrival", request_id)
+
+        prefill_queue: List[int] = []
+        prefill_free = list(range(self._num_prefill_replicas))
+        prefill_busy_time_s = 0.0
+        link_free_at = [0.0] * self._num_prefill_replicas
+
+        decode_queue: List[int] = []
+        decode_replicas = [_DecodeReplica() for _ in range(self._num_decode_replicas)]
+
+        prefill_done_at = [0.0] * num_requests
+        kv_transfer_s = [0.0] * num_requests
+        completed_at = [0.0] * num_requests
+        batch_size_samples: List[int] = []
+
+        def dispatch_prefill(now: float) -> None:
+            nonlocal prefill_busy_time_s
+            while prefill_free and prefill_queue:
+                replica_id = prefill_free.pop(0)
+                request_id = prefill_queue.pop(0)
+                duration = self._prefill_time_fn(requests[request_id][1])
+                prefill_busy_time_s += duration
+                push(now + duration, "prefill_done", (request_id, replica_id))
+
+        def run_decode_iteration(now: float, replica_id: int) -> None:
+            replica = decode_replicas[replica_id]
+            while decode_queue and len(replica.running) < self._max_decode_batch_size:
+                request_id = decode_queue.pop(0)
+                _, num_prefill_tokens, num_decode_tokens = requests[request_id]
+                # the first output token was produced by the prefill replica
+                replica.running[request_id] = [
+                    num_prefill_tokens + 1,
+                    num_decode_tokens - 1,
+                ]
+            if not replica.running:
+                replica.busy = False
+                return
+            batch_size = len(replica.running)
+            avg_kv_tokens = int(
+                sum(state[0] for state in replica.running.values()) / batch_size
+            )
+            duration = self._decode_step_time_fn(batch_size, avg_kv_tokens)
+            replica.busy = True
+            replica.busy_time_s += duration
+            batch_size_samples.append(batch_size)
+            push(now + duration, "decode_step_done", replica_id)
+
+        def wake_idle_decode_replicas(now: float) -> None:
+            for replica_id, replica in enumerate(decode_replicas):
+                if not decode_queue:
+                    return
+                if not replica.busy:
+                    run_decode_iteration(now, replica_id)
+
+        now = 0.0
+        while events:
+            now, _, kind, payload = heapq.heappop(events)
+
+            if kind == "arrival":
+                prefill_queue.append(payload)
+                dispatch_prefill(now)
+
+            elif kind == "prefill_done":
+                request_id, replica_id = payload
+                prefill_done_at[request_id] = now
+                prefill_free.append(replica_id)
+                dispatch_prefill(now)
+
+                if requests[request_id][2] <= 1:
+                    completed_at[request_id] = now
+                    continue
+                start = max(now, link_free_at[replica_id])
+                end = start + self.kv_transfer_time_s(requests[request_id][1])
+                link_free_at[replica_id] = end
+                kv_transfer_s[request_id] = end - now
+                push(end, "kv_transfer_done", request_id)
+
+            elif kind == "kv_transfer_done":
+                decode_queue.append(payload)
+                wake_idle_decode_replicas(now)
+
+            elif kind == "decode_step_done":
+                replica = decode_replicas[payload]
+                for request_id in list(replica.running):
+                    state = replica.running[request_id]
+                    state[0] += 1
+                    state[1] -= 1
+                    if state[1] == 0:
+                        completed_at[request_id] = now
+                        del replica.running[request_id]
+                run_decode_iteration(now, payload)
+
+        makespan_s = max(completed_at) - requests[0][0]
+
+        ttft = [prefill_done_at[i] - requests[i][0] for i in range(num_requests)]
+        e2e = [completed_at[i] - requests[i][0] for i in range(num_requests)]
+        tpot = [
+            (completed_at[i] - prefill_done_at[i]) / (requests[i][2] - 1)
+            for i in range(num_requests)
+            if requests[i][2] > 1
+        ]
+        transferred = [
+            kv_transfer_s[i] for i in range(num_requests) if requests[i][2] > 1
+        ]
 
         return DisaggregatedSimulationResult(
-            num_requests=n,
-            prefill_fleet_size=self._prefill_fleet_size,
-            decode_fleet_size=self._decode_fleet_size,
-            interconnect_bandwidth_gbps=self._bandwidth_gbps,
-            p50_e2e_latency_s=float(np.percentile(e2e, 50)),
-            p90_e2e_latency_s=float(np.percentile(e2e, 90)),
-            p99_e2e_latency_s=float(np.percentile(e2e, 99)),
-            mean_e2e_latency_s=float(e2e.mean()),
-            p50_ttft_s=float(np.percentile(ttft, 50)),
-            p90_ttft_s=float(np.percentile(ttft, 90)),
-            mean_ttft_s=float(ttft.mean()),
-            p50_kv_transfer_s=float(np.percentile(kv_lat, 50)),
-            mean_kv_transfer_s=float(kv_lat.mean()),
-            prefill_utilisation=float(prefill_util),
-            decode_utilisation=float(decode_util),
-            throughput_rps=float(len(e2e_latencies) / total_sim_time),
+            num_requests=num_requests,
+            makespan_s=makespan_s,
+            throughput_rps=num_requests / makespan_s if makespan_s > 0 else 0.0,
+            ttft_s=_percentiles(ttft),
+            tpot_s=_percentiles(tpot),
+            e2e_s=_percentiles(e2e),
+            kv_transfer_s=_percentiles(transferred),
+            prefill_utilization=prefill_busy_time_s
+            / (makespan_s * self._num_prefill_replicas),
+            decode_utilization=sum(r.busy_time_s for r in decode_replicas)
+            / (makespan_s * self._num_decode_replicas),
+            mean_decode_batch_size=(
+                float(np.mean(batch_size_samples)) if batch_size_samples else 0.0
+            ),
+            max_decode_batch_size_observed=max(batch_size_samples, default=0),
         )
+
+
+def build_time_fns_from_predictor(
+    execution_time_predictor: BaseExecutionTimePredictor,
+    predictor_config: BaseExecutionTimePredictorConfig,
+) -> Tuple[Callable[[int], float], Callable[[int, int], float]]:
+    """Wrap Vidur's execution time predictor as P/D step-time functions.
+
+    Builds single-stage batches with the same request state transitions the
+    replica schedulers use (``Request.on_batch_end``).  Decode batches are
+    synthesised with every request at the batch-average KV length, which is
+    exactly the quantity the sklearn predictors key their attention model on.
+    """
+    granularity = predictor_config.kv_cache_prediction_granularity
+    prefill_cache: Dict[int, float] = {}
+    decode_cache: Dict[Tuple[int, int], float] = {}
+
+    def prefill_time_fn(num_prefill_tokens: int) -> float:
+        if num_prefill_tokens not in prefill_cache:
+            request = Request(0, num_prefill_tokens, 1)
+            batch = Batch(0, [request], [num_prefill_tokens])
+            prefill_cache[num_prefill_tokens] = (
+                execution_time_predictor.get_execution_time(batch, 0).total_time
+            )
+        return prefill_cache[num_prefill_tokens]
+
+    def decode_step_time_fn(batch_size: int, avg_kv_tokens: int) -> float:
+        kv_tokens = max(granularity, -(-avg_kv_tokens // granularity) * granularity)
+        key = (batch_size, kv_tokens)
+        if key not in decode_cache:
+            decode_requests = []
+            for _ in range(batch_size):
+                # prompt of kv_tokens - 1; prefill completion adds the first token
+                request = Request(0, kv_tokens - 1, 2)
+                request.on_batch_end(0, kv_tokens - 1)
+                decode_requests.append(request)
+            batch = Batch(0, decode_requests, [1] * batch_size)
+            decode_cache[key] = execution_time_predictor.get_execution_time(
+                batch, 0
+            ).total_time
+        return decode_cache[key]
+
+    return prefill_time_fn, decode_step_time_fn
